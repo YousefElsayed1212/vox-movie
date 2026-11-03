@@ -1,0 +1,46 @@
+name: Telegram Notification Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-telegram:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send test message
+        env:
+          TOKEN: ${{ secrets.TOKEN || secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID || secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python - <<'PY'
+          import os
+          import requests
+
+          token = os.environ.get("TOKEN")
+          chat_id = os.environ.get("CHAT_ID")
+          if not token or not chat_id:
+              raise SystemExit(
+                  "Missing Telegram secrets. Add TOKEN and CHAT_ID, "
+                  "or TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID."
+              )
+
+          response = requests.post(
+              f"https://api.telegram.org/bot{token}/sendMessage",
+              json={
+                  "chat_id": chat_id,
+                  "text": (
+                      "✅ VOX Movie Monitor — Telegram test successful!\n\n"
+                      "This confirms the bot can send notifications to this chat. "
+                      "The monitor will use the same Telegram connection for new "
+                      "booking slots."
+                  ),
+                  "disable_web_page_preview": True,
+              },
+              timeout=20,
+          )
+          response.raise_for_status()
+          result = response.json()
+          if not result.get("ok"):
+              raise SystemExit(f"Telegram API error: {result}")
+          print("Telegram test message sent successfully.")
+          PY
