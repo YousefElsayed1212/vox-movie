@@ -13,6 +13,7 @@ from urllib3.util.retry import Retry
 
 BASE_URL = "https://egy.voxcinemas.com"
 SHOWTIMES_URL = f"{BASE_URL}/showtimes"
+BRANCH_SHOWTIMES_URL = f"{BASE_URL}/showtimes/{CINEMA}"
 CINEMA = "city-centre-almaza"
 BRANCH = "City Centre Almaza"
 STATE_FILE = "seen.json"
@@ -165,10 +166,9 @@ def main():
     old_movies = old["movies"]
 
     # The current date page also provides links to the upcoming showtime dates.
-    first_page = get_soup(
-        SHOWTIMES_URL,
-        {"c": CINEMA, "d": today},
-    )
+    # Start with VOX's dedicated branch page instead of the filtered query URL.
+    # Date links on this page are used for the remaining days.
+    first_page = get_soup(BRANCH_SHOWTIMES_URL)
 
     page_text = first_page.get_text(" ", strip=True).lower()
     if "view times and book" not in page_text or "city centre almaza" not in page_text:
