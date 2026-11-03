@@ -173,86 +173,129 @@ def load_state():
 
 def main():
     today = datetime.now(ZoneInfo("Africa/Cairo")).strftime("%Y%m%d")
-    print(f"VOX monitor started — {BRANCH} — {today}")
-
-    first_page = get_soup(SHOWTIMES_URL, {"c": CINEMA, "d": today})
-    dates = get_available_dates(first_page, today)
-    current_movies = {}
-
-    for date in dates:
-        print(f"Checking showtimes for {date}")
-        page = first_page if date == today else get_soup(
-            SHOWTIMES_URL, {"c": CINEMA, "d": date}
-        )
-        for slug, movie in extract_showtimes(page, date).items():
-            item = current_movies.setdefault(
-                slug, {"name": movie["name"], "link": movie["link"], "slots": {}}
-            )
-            item["slots"].update(movie["slots"])
-
-    if not current_movies:
-        raise RuntimeError("No showtimes found for City Centre Almaza; refusing to overwrite saved state.")
-
-    print("Checking Coming Soon page")
-    current_coming = extract_coming_soon(get_soup(COMING_SOON_URL))
-    print(f"Found {len(current_movies)} movies with showtimes and {len(current_coming)} coming-soon movies.")
+    print(f"VOX monitor started — {BRANCH} — {today}", flush=True)
 
     old = load_state()
     old_movies = old["movies"]
     old_coming = old["coming_soon"]
 
-    if not old["initialized"]:
-        print("First successful run: creating baseline; no notifications will be sent.")
+    # Older state files used one shared initialized flag. Keep them compatible.
+    showtimes_initialized = old.get("showtimes_initialized", old["initialized"])
+    coming_initialized = old.get("coming_initialized", old["initialized"])
+
+    current_movies = None
+    current_coming = None
+
+    # Try showtimes independently. If VOX's showtimes endpoint hangs, still
+    # continue to check Coming Soon rather than aborting the entire workflow.
+    try:
+        first_page = get_soup(SHOWTIMES_URL, {"c": CINEMA, "d": today})
+        dates = get_available_dates(first_page, today)
+        scraped_movies = {}
+
+        for date in dates:
+            print(f"Checking showtimes for {date}", flush=True)
+            page = first_page if date == today else get_soup(
+                SHOWTIMES_URL, {"c": CINEMA, "d": date}
+            )
+            for slug, movie in extract_showtimes(page, date).items():
+                item = scraped_movies.setdefault(
+                    slug, {"name": movie["name"], "link": movie["link"], "slots": {}}
+                )
+                item["slots"].update(movie["slots"])
+
+        if not scraped_movies:
+            raise RuntimeError("No showtimes found for City Centre Almaza.")
+        current_movies = scraped_movies
+        print(f"Showtimes: found {len(current_movies)} movies.", flush=True)
+
+    except (requests.exceptions.RequestException, RuntimeError) as error:
+        print(
+            f"WARNING: Showtimes check failed; keeping previous showtimes state. Reason: {error}",
+            flush=True,
+        )
+
+    # Check Coming Soon even if the showtimes endpoint is unavailable.
+    try:
+        print("Checking Coming Soon page", flush=True)
+        current_coming = extract_coming_soon(get_soup(COMING_SOON_URL))
+        print(f"Coming Soon: found {len(current_coming)} movies.", flush=True)
+    except (requests.exceptions.RequestException, RuntimeError) as error:
+        print(
+            f"WARNING: Coming Soon check failed; keeping previous Coming Soon state. Reason: {error}",
+            flush=True,
+        )
+
+    if current_movies is None and current_coming is None:
+        raise RuntimeError("Both VOX sources failed. No state was changed.")
+
+    # First successful read of each feed creates its own baseline.
+    if current_coming is not None:
+        if not coming_initialized:
+            print("Creating Coming Soon baseline; no old films will be notified.", flush=True)
+        else:
+            for slug, movie in current_coming.items():
+                if slug not in old_coming:
+                    send_telegram(
+                        "🎬 فيلم جديد في Coming Soon!\n\n"
+                        f"🍿 {movie['name']}\n"
+                        f"📅 Release: {movie['release_date']}\n"
+                        f"🔗 {movie['link']}"
+                    )
+
+    if current_movies is not None:
+        if not showtimes_initialized:
+            print("Creating showtimes baseline; no existing slots will be notified.", flush=True)
+        else:
+            for slug, movie in current_movies.items():
+                previous = old_movies.get(slug, {})
+                old_slots = set(previous.get("slots", {}))
+                new_slots = set(movie["slots"]) - old_slots
+
+                for key in sorted(new_slots):
+                    slot = movie["slots"][key]
+                    send_telegram(
+                        "🆕 موعد عرض/حجز جديد!\n\n"
+                        f"🎬 {movie['name']}\n"
+                        f"📍 {BRANCH}\n"
+                        f"📅 {slot['date']}\n"
+                        f"🕒 {slot['time']}\n"
+                        f"🎥 {slot['format']}\n\n"
+                        f"🎟️ احجز الآن:\n{slot['booking']}"
+                    )
+
+    # Preserve the last known good data for any feed that failed this run.
+    if current_movies is None:
+        merged_movies = old_movies
     else:
-        for slug, movie in current_coming.items():
-            if slug not in old_coming:
-                send_telegram(
-                    "🎬 فيلم جديد في Coming Soon!\n\n"
-                    f"🍿 {movie['name']}\n"
-                    f"📅 Release: {movie['release_date']}\n"
-                    f"🔗 {movie['link']}"
-                )
-
+        merged_movies = {}
         for slug, movie in current_movies.items():
-            previous = old_movies.get(slug, {})
-            old_slots = set(previous.get("slots", {}))
-            new_slots = set(movie["slots"]) - old_slots
+            previous_slots = old_movies.get(slug, {}).get("slots", {})
+            merged_movies[slug] = {
+                "name": movie["name"],
+                "link": movie["link"],
+                "slots": {**previous_slots, **movie["slots"]},
+            }
 
-            if slug not in old_movies and not old_slots:
-                print(f"New showtime listing: {movie['name']}")
-
-            for key in sorted(new_slots):
-                slot = movie["slots"][key]
-                send_telegram(
-                    "🆕 موعد عرض/حجز جديد!\n\n"
-                    f"🎬 {movie['name']}\n"
-                    f"📍 {BRANCH}\n"
-                    f"📅 {slot['date']}\n"
-                    f"🕒 {slot['time']}\n"
-                    f"🎥 {slot['format']}\n\n"
-                    f"🎟️ احجز الآن:\n{slot['booking']}"
-                )
-
-    # Preserve previously seen slots so a temporarily missing date does not cause repeat alerts.
-    merged_movies = {}
-    for slug, movie in current_movies.items():
-        previous_slots = old_movies.get(slug, {}).get("slots", {})
-        merged_movies[slug] = {
-            "name": movie["name"],
-            "link": movie["link"],
-            "slots": {**previous_slots, **movie["slots"]},
-        }
+    saved_coming = current_coming if current_coming is not None else old_coming
 
     state = {
         "initialized": True,
+        "showtimes_initialized": showtimes_initialized or current_movies is not None,
+        "coming_initialized": coming_initialized or current_coming is not None,
         "movies": merged_movies,
-        "coming_soon": current_coming,
+        "coming_soon": saved_coming,
         "updated_at": datetime.now(ZoneInfo("Africa/Cairo")).isoformat(),
     }
     with open(STATE_FILE, "w", encoding="utf-8") as file:
         json.dump(state, file, ensure_ascii=False, indent=2)
 
-    print("Monitoring completed successfully.")
+    if current_movies is None:
+        print("Completed with warning: showtimes unavailable; Coming Soon may still have updated.", flush=True)
+    elif current_coming is None:
+        print("Completed with warning: Coming Soon unavailable; showtimes may still have updated.", flush=True)
+    else:
+        print("Monitoring completed successfully.", flush=True)
 
 
 if __name__ == "__main__":
