@@ -1,70 +1,86 @@
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from urllib.parse import parse_qs, urljoin, urlparse
 from zoneinfo import ZoneInfo
 
 import requests
+from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from bs4 import BeautifulSoup
 
 BASE_URL = "https://egy.voxcinemas.com"
 SHOWTIMES_URL = f"{BASE_URL}/showtimes"
-COMING_SOON_URL = f"{BASE_URL}/movies/comingsoon"
 CINEMA = "city-centre-almaza"
 BRANCH = "City Centre Almaza"
 STATE_FILE = "seen.json"
 
+# Only alert for these three movie versions.
+TARGET_MOVIES = {
+    "dune part three",
+    "avengers doomsday",
+    "avengers doomsday infinity vision",
+}
+
 TOKEN = os.getenv("TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID")
 if not TOKEN or not CHAT_ID:
-    raise RuntimeError("Missing Telegram secrets. Add TOKEN and CHAT_ID (or TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID).")
+    raise RuntimeError(
+        "Missing Telegram secrets. Add TOKEN and CHAT_ID "
+        "(or TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)."
+    )
 
 session = requests.Session()
-
-# VOX can respond slowly or temporarily drop connections.
+# Fail quickly. The workflow runs every five minutes, so the next run can retry.
 retry_policy = Retry(
-    total=4,
-    connect=4,
-    read=4,
-    status=3,
-    backoff_factor=3,
-    status_forcelist=(429, 500, 502, 503, 504),
+    total=0,
+    connect=0,
+    read=0,
+    status=0,
     allowed_methods=frozenset(["GET"]),
-    respect_retry_after_header=True,
 )
-adapter = HTTPAdapter(max_retries=retry_policy, pool_connections=10, pool_maxsize=10)
+adapter = HTTPAdapter(max_retries=retry_policy)
 session.mount("https://", adapter)
 session.mount("http://", adapter)
-
 session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 Chrome/126.0 Safari/537.36"
+    ),
     "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
 })
 
 
+def normalize_title(value):
+    value = value.lower().replace("&", " and ")
+    return re.sub(r"[^a-z0-9]+", " ", value).strip()
+
+
 def get_soup(url, params=None):
-    print(f"Requesting: {url}" + (f" | params={params}" if params else ""), flush=True)
-    try:
-        response = session.get(url, params=params, timeout=(20, 90))
-        response.raise_for_status()
-    except requests.exceptions.RequestException as error:
-        print(f"VOX request failed after retries: {error}", flush=True)
-        raise
+    print(
+        f"Requesting: {url}" + (f" | params={params}" if params else ""),
+        flush=True,
+    )
+    response = session.get(url, params=params, timeout=(6, 18))
+    response.raise_for_status()
     print(f"Received {len(response.content)} bytes from VOX.", flush=True)
     return BeautifulSoup(response.text, "html.parser")
 
 
 def send_telegram(message):
-    # Telegram text messages are limited to 4096 characters.
     if len(message) > 4000:
         message = message[:3950] + "\n…"
     response = session.post(
         f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-        data={"chat_id": CHAT_ID, "text": message, "disable_web_page_preview": True},
-        timeout=25,
+        data={
+            "chat_id": CHAT_ID,
+            "text": message,
+            "disable_web_page_preview": True,
+        },
+        timeout=(6, 15),
     )
     response.raise_for_status()
     payload = response.json()
@@ -82,30 +98,37 @@ def get_available_dates(soup, today):
     return sorted(dates)
 
 
-def extract_showtimes(soup, date):
+def extract_target_showtimes(soup, date):
     found = {}
+
     for article in soup.select("article.movie-compare"):
         heading = article.select_one("h2")
         if not heading:
             continue
 
         name = heading.get_text(" ", strip=True)
-        slug = article.get("data-slug")
-        if not slug:
+        normalized = normalize_title(name)
+        if normalized not in TARGET_MOVIES:
             continue
 
+        slug = article.get("data-slug") or normalized.replace(" ", "-")
         details = article.select_one("a.read-more[href]")
         movie_url = urljoin(BASE_URL, details["href"]) if details else SHOWTIMES_URL
-        movie = found.setdefault(slug, {"name": name, "link": movie_url, "slots": {}})
+        movie = found.setdefault(
+            slug, {"name": name, "link": movie_url, "slots": {}}
+        )
 
         for group in article.select("ol.showtimes > li"):
             format_tag = group.find("strong")
-            cinema_format = format_tag.get_text(" ", strip=True) if format_tag else "Standard"
+            cinema_format = (
+                format_tag.get_text(" ", strip=True) if format_tag else "Standard"
+            )
 
             for link in group.select("a.showtime[href]"):
                 slot_id = link.get("data-id")
                 if not slot_id:
                     continue
+
                 key = f"{date}_{slot_id}"
                 movie["slots"][key] = {
                     "date": date,
@@ -113,187 +136,133 @@ def extract_showtimes(soup, date):
                     "format": cinema_format,
                     "booking": urljoin(BASE_URL, link["href"]),
                 }
+
     return found
-
-
-def extract_coming_soon(soup):
-    """Extract upcoming films without depending on one exact card class."""
-    movies = {}
-
-    for link in soup.select('a[href*="/movies/"]'):
-        href = link.get("href", "")
-        path = urlparse(href).path.rstrip("/")
-        if not path or path in ("/movies/comingsoon", "/movies/whatson"):
-            continue
-
-        # Find a nearby card/container that contains the movie title and release date.
-        container = link
-        for _ in range(5):
-            if container.parent and getattr(container.parent, "name", None):
-                container = container.parent
-            text = container.get_text(" ", strip=True)
-            heading = container.find(["h1", "h2", "h3", "h4"])
-            if heading and re.search(r"release\s*date", text, re.I):
-                break
-
-        heading = container.find(["h1", "h2", "h3", "h4"])
-        if not heading:
-            heading = link.find(["h1", "h2", "h3", "h4"])
-        name = heading.get_text(" ", strip=True) if heading else link.get_text(" ", strip=True)
-        if not name or len(name) > 180:
-            continue
-
-        text = container.get_text(" ", strip=True)
-        match = re.search(
-            r"Release\s*Date\s*:?\s*(.*?)(?=Starring\s*:|Language\s*:|View\s*Movie|$)",
-            text,
-            re.I,
-        )
-        release_date = re.sub(r"\s+", " ", match.group(1)).strip() if match else "Not announced"
-        movie_url = urljoin(BASE_URL, href)
-        slug = path.split("/")[-1]
-        movies[slug] = {"name": name, "link": movie_url, "release_date": release_date}
-
-    if not movies:
-        raise RuntimeError("Coming Soon extraction returned zero films; refusing to overwrite saved state.")
-    return movies
 
 
 def load_state():
     if not os.path.exists(STATE_FILE):
-        return {"initialized": False, "movies": {}, "coming_soon": {}}
+        return {"initialized": False, "movies": {}}
+
     with open(STATE_FILE, "r", encoding="utf-8") as file:
         data = json.load(file)
+
     return {
         "initialized": bool(data.get("initialized", False)),
         "movies": data.get("movies", {}),
-        "coming_soon": data.get("coming_soon", {}),
     }
 
 
 def main():
     today = datetime.now(ZoneInfo("Africa/Cairo")).strftime("%Y%m%d")
-    print(f"VOX monitor started — {BRANCH} — {today}", flush=True)
+    print(
+        f"VOX booking monitor started — {BRANCH} — {today}",
+        flush=True,
+    )
+    print("Targets: Dune: Part Three; Avengers: Doomsday; Avengers: Doomsday (Infinity Vision)", flush=True)
 
     old = load_state()
     old_movies = old["movies"]
-    old_coming = old["coming_soon"]
 
-    # Older state files used one shared initialized flag. Keep them compatible.
-    showtimes_initialized = old.get("showtimes_initialized", old["initialized"])
-    coming_initialized = old.get("coming_initialized", old["initialized"])
+    # The current date page also provides links to the upcoming showtime dates.
+    first_page = get_soup(
+        SHOWTIMES_URL,
+        {"c": CINEMA, "d": today},
+    )
 
-    current_movies = None
-    current_coming = None
+    page_text = first_page.get_text(" ", strip=True).lower()
+    if "view times and book" not in page_text or "city centre almaza" not in page_text:
+        raise RuntimeError(
+            "VOX page did not contain the expected cinema/showtimes content; "
+            "saved state was not changed."
+        )
 
-    # Try showtimes independently. If VOX's showtimes endpoint hangs, still
-    # continue to check Coming Soon rather than aborting the entire workflow.
-    try:
-        first_page = get_soup(SHOWTIMES_URL, {"c": CINEMA, "d": today})
-        dates = get_available_dates(first_page, today)
-        scraped_movies = {}
+    dates = get_available_dates(first_page, today)
+    print(f"Dates discovered: {', '.join(dates)}", flush=True)
 
-        for date in dates:
-            print(f"Checking showtimes for {date}", flush=True)
-            page = first_page if date == today else get_soup(
-                SHOWTIMES_URL, {"c": CINEMA, "d": date}
-            )
-            for slug, movie in extract_showtimes(page, date).items():
-                item = scraped_movies.setdefault(
-                    slug, {"name": movie["name"], "link": movie["link"], "slots": {}}
-                )
-                item["slots"].update(movie["slots"])
+    scraped_movies = {}
+    failed_dates = []
 
-        if not scraped_movies:
-            raise RuntimeError("No showtimes found for City Centre Almaza.")
-        current_movies = scraped_movies
-        print(f"Showtimes: found {len(current_movies)} movies.", flush=True)
+    def fetch_date(date):
+        page = first_page if date == today else get_soup(
+            SHOWTIMES_URL, {"c": CINEMA, "d": date}
+        )
+        return date, extract_target_showtimes(page, date)
 
-    except (requests.exceptions.RequestException, RuntimeError) as error:
+    # Check dates concurrently so a long list of future dates does not delay alerts.
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {executor.submit(fetch_date, date): date for date in dates}
+        for future in as_completed(futures):
+            date = futures[future]
+            try:
+                _, day_movies = future.result()
+                for slug, movie in day_movies.items():
+                    item = scraped_movies.setdefault(
+                        slug,
+                        {"name": movie["name"], "link": movie["link"], "slots": {}},
+                    )
+                    item["slots"].update(movie["slots"])
+            except requests.exceptions.RequestException as error:
+                failed_dates.append(date)
+                print(f"WARNING: Could not check {date}: {error}", flush=True)
+
+    print(
+        f"Target movies found: {len(scraped_movies)}; "
+        f"slots found: {sum(len(m['slots']) for m in scraped_movies.values())}",
+        flush=True,
+    )
+    if failed_dates:
         print(
-            f"WARNING: Showtimes check failed; keeping previous showtimes state. Reason: {error}",
+            "WARNING: Some dates could not be checked: " + ", ".join(sorted(failed_dates)),
             flush=True,
         )
 
-    # Check Coming Soon even if the showtimes endpoint is unavailable.
-    try:
-        print("Checking Coming Soon page", flush=True)
-        current_coming = extract_coming_soon(get_soup(COMING_SOON_URL))
-        print(f"Coming Soon: found {len(current_coming)} movies.", flush=True)
-    except (requests.exceptions.RequestException, RuntimeError) as error:
+    # An empty result is valid: it means these films do not have bookable slots yet.
+    if not old["initialized"]:
         print(
-            f"WARNING: Coming Soon check failed; keeping previous Coming Soon state. Reason: {error}",
+            "Creating first baseline. Any slots already visible now will not trigger alerts.",
             flush=True,
         )
-
-    if current_movies is None and current_coming is None:
-        raise RuntimeError("Both VOX sources failed. No state was changed.")
-
-    # First successful read of each feed creates its own baseline.
-    if current_coming is not None:
-        if not coming_initialized:
-            print("Creating Coming Soon baseline; no old films will be notified.", flush=True)
-        else:
-            for slug, movie in current_coming.items():
-                if slug not in old_coming:
-                    send_telegram(
-                        "🎬 فيلم جديد في Coming Soon!\n\n"
-                        f"🍿 {movie['name']}\n"
-                        f"📅 Release: {movie['release_date']}\n"
-                        f"🔗 {movie['link']}"
-                    )
-
-    if current_movies is not None:
-        if not showtimes_initialized:
-            print("Creating showtimes baseline; no existing slots will be notified.", flush=True)
-        else:
-            for slug, movie in current_movies.items():
-                previous = old_movies.get(slug, {})
-                old_slots = set(previous.get("slots", {}))
-                new_slots = set(movie["slots"]) - old_slots
-
-                for key in sorted(new_slots):
-                    slot = movie["slots"][key]
-                    send_telegram(
-                        "🆕 موعد عرض/حجز جديد!\n\n"
-                        f"🎬 {movie['name']}\n"
-                        f"📍 {BRANCH}\n"
-                        f"📅 {slot['date']}\n"
-                        f"🕒 {slot['time']}\n"
-                        f"🎥 {slot['format']}\n\n"
-                        f"🎟️ احجز الآن:\n{slot['booking']}"
-                    )
-
-    # Preserve the last known good data for any feed that failed this run.
-    if current_movies is None:
-        merged_movies = old_movies
     else:
-        merged_movies = {}
-        for slug, movie in current_movies.items():
-            previous_slots = old_movies.get(slug, {}).get("slots", {})
-            merged_movies[slug] = {
-                "name": movie["name"],
-                "link": movie["link"],
-                "slots": {**previous_slots, **movie["slots"]},
-            }
+        for slug, movie in scraped_movies.items():
+            previous = old_movies.get(slug, {})
+            old_slots = set(previous.get("slots", {}))
+            new_slots = set(movie["slots"]) - old_slots
 
-    saved_coming = current_coming if current_coming is not None else old_coming
+            for key in sorted(new_slots):
+                slot = movie["slots"][key]
+                send_telegram(
+                    "🚨 NEW VOX BOOKING AVAILABLE!\n\n"
+                    f"🎬 {movie['name']}\n"
+                    f"📍 {BRANCH}\n"
+                    f"📅 {slot['date']}\n"
+                    f"🕒 {slot['time']}\n"
+                    f"🎥 {slot['format']}\n\n"
+                    f"🎟️ BOOK NOW:\n{slot['booking']}"
+                )
+                print(f"Telegram alert sent: {movie['name']} — {slot['date']} {slot['time']}", flush=True)
+
+    # Keep old slots too, so a slot disappearing and later reappearing is not
+    # mistaken for a brand-new booking.
+    merged_movies = dict(old_movies)
+    for slug, movie in scraped_movies.items():
+        previous_slots = old_movies.get(slug, {}).get("slots", {})
+        merged_movies[slug] = {
+            "name": movie["name"],
+            "link": movie["link"],
+            "slots": {**previous_slots, **movie["slots"]},
+        }
 
     state = {
         "initialized": True,
-        "showtimes_initialized": showtimes_initialized or current_movies is not None,
-        "coming_initialized": coming_initialized or current_coming is not None,
         "movies": merged_movies,
-        "coming_soon": saved_coming,
         "updated_at": datetime.now(ZoneInfo("Africa/Cairo")).isoformat(),
     }
     with open(STATE_FILE, "w", encoding="utf-8") as file:
         json.dump(state, file, ensure_ascii=False, indent=2)
 
-    if current_movies is None:
-        print("Completed with warning: showtimes unavailable; Coming Soon may still have updated.", flush=True)
-    elif current_coming is None:
-        print("Completed with warning: Coming Soon unavailable; showtimes may still have updated.", flush=True)
+    if failed_dates:
+        print("Monitoring completed with warnings; failed dates will be retried next run.", flush=True)
     else:
         print("Monitoring completed successfully.", flush=True)
 
