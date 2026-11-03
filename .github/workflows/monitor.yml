@@ -15,7 +15,7 @@ concurrency:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -28,6 +28,9 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
+      - name: Install Chrome
+        uses: browser-actions/setup-chrome@v1
+
       - name: Install dependencies
         run: pip install -r requirements.txt
 
@@ -37,7 +40,17 @@ jobs:
           CHAT_ID: ${{ secrets.CHAT_ID }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python bot.py
+        run: python -u bot.py
+
+      - name: Upload VOX debug snapshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vox-debug-snapshots
+          path: |
+            debug_vox_*.png
+            debug_vox_*.html
+          if-no-files-found: ignore
 
       - name: Save monitoring state
         if: success()
