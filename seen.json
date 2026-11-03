@@ -1100,7 +1100,18 @@
       "time": "10:00pm",
       "booking": "https://egy.voxcinemas.com/booking/0047-276952",
       "movie_info": "https://egy.voxcinemas.com/movies/avengers-doomsday-infinity-vision"
+    },
+    "2026-12-16:0047-276798": {
+      "key": "2026-12-16:0047-276798",
+      "movie": "Avengers: Doomsday (Infinity Vision)",
+      "listed_title": "Avengers: Doomsday (Infinity Vision)",
+      "hall": "Standard",
+      "date": "2026-12-16",
+      "day": "Wed 16 Dec",
+      "time": "11:15am",
+      "booking": "https://egy.voxcinemas.com/booking/0047-276798",
+      "movie_info": "https://egy.voxcinemas.com/movies/avengers-doomsday-infinity-vision"
     }
   },
-  "updated_at": "2026-11-03T09:53:10.296499+02:00"
+  "updated_at": "2026-11-03T17:54:58.812992+02:00"
 }
