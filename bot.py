@@ -13,8 +13,8 @@ from urllib3.util.retry import Retry
 
 BASE_URL = "https://egy.voxcinemas.com"
 SHOWTIMES_URL = f"{BASE_URL}/showtimes"
-BRANCH_SHOWTIMES_URL = f"{BASE_URL}/showtimes/{CINEMA}"
 CINEMA = "city-centre-almaza"
+BRANCH_SHOWTIMES_URL = f"{BASE_URL}/showtimes/{CINEMA}"
 BRANCH = "City Centre Almaza"
 STATE_FILE = "seen.json"
 
