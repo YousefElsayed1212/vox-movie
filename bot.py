@@ -6,6 +6,8 @@ from urllib.parse import parse_qs, urljoin, urlparse
 from zoneinfo import ZoneInfo
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 
 BASE_URL = "https://egy.voxcinemas.com"
@@ -21,6 +23,22 @@ if not TOKEN or not CHAT_ID:
     raise RuntimeError("Missing Telegram secrets. Add TOKEN and CHAT_ID (or TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID).")
 
 session = requests.Session()
+
+# VOX can respond slowly or temporarily drop connections.
+retry_policy = Retry(
+    total=4,
+    connect=4,
+    read=4,
+    status=3,
+    backoff_factor=3,
+    status_forcelist=(429, 500, 502, 503, 504),
+    allowed_methods=frozenset(["GET"]),
+    respect_retry_after_header=True,
+)
+adapter = HTTPAdapter(max_retries=retry_policy, pool_connections=10, pool_maxsize=10)
+session.mount("https://", adapter)
+session.mount("http://", adapter)
+
 session.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36",
     "Accept-Language": "en-US,en;q=0.9",
@@ -28,8 +46,14 @@ session.headers.update({
 
 
 def get_soup(url, params=None):
-    response = session.get(url, params=params, timeout=35)
-    response.raise_for_status()
+    print(f"Requesting: {url}" + (f" | params={params}" if params else ""), flush=True)
+    try:
+        response = session.get(url, params=params, timeout=(20, 90))
+        response.raise_for_status()
+    except requests.exceptions.RequestException as error:
+        print(f"VOX request failed after retries: {error}", flush=True)
+        raise
+    print(f"Received {len(response.content)} bytes from VOX.", flush=True)
     return BeautifulSoup(response.text, "html.parser")
 
 
