@@ -129,11 +129,16 @@ def target_kind(title, hall_name):
     normalized_title = normalize(title)
     normalized_hall = normalize(hall_name)
 
+    # Match the movie title independently from the auditorium/format.
+    # Every showtime for either target movie is monitored, including MAX,
+    # IMAX, Standard, and any newly introduced format.
     if TARGET_DUNE in normalized_title or "dune part 3" in normalized_title:
         return "Dune: Part Three"
 
     if TARGET_AVENGERS in normalized_title:
-        if "infinity vision" in normalized_hall:
+        # Infinity Vision may be shown in the movie title or hall label,
+        # depending on how VOX renders the listing.
+        if "infinity vision" in normalized_title or "infinity vision" in normalized_hall:
             return "Avengers: Doomsday (Infinity Vision)"
         return "Avengers: Doomsday"
 
