@@ -1,26 +1,37 @@
-# VOX Movies Monitor
+# VOX Movies Booking Monitor
 
-Telegram monitor for **VOX Cinemas Egypt — City Centre Almaza**.
+Telegram alert bot for **VOX Cinemas Egypt — City Centre Almaza**.
 
-## What it monitors
+## Movies monitored
 
-- **Showtimes:** new booking/showtime slots, including date, time, cinema format, and booking link.
-- **Coming Soon:** newly listed upcoming films and their release dates.
-- Checks every **5 minutes** using GitHub Actions, so your computer does not need to stay on.
-- Saves seen movies and showtimes in `seen.json` to avoid duplicate notifications.
+- **Dune: Part Three** — all listed showtimes and formats.
+- **Avengers: Doomsday** — showtimes outside the Infinity Vision hall.
+- **Avengers: Doomsday (Infinity Vision)** — showtimes specifically listed under the Infinity Vision hall.
 
-## Setup
+The bot detects new showtime booking IDs and sends a Telegram alert with the date, time, hall, and a direct booking button. It checks every five minutes through GitHub Actions, so your computer can be off.
 
-1. Open **Settings → Secrets and variables → Actions**.
-2. Add your Telegram bot token and chat ID as repository secrets. Either naming pair is supported:
+## How it works
+
+- Uses **Selenium with headless Chrome** to load VOX like a real browser, including page-rendered content.
+- Discovers the dates currently open for booking from the VOX date navigation.
+- Reads showtime booking IDs from the showtime list items.
+- Saves previously seen slots in `seen.json` and avoids duplicate alerts.
+- Sends an alert only after Telegram confirms the message was sent.
+- Uploads HTML and screenshot debug files if VOX fails to load.
+
+## GitHub setup
+
+1. In **Settings → Secrets and variables → Actions**, add either:
    - `TOKEN` and `CHAT_ID`, or
    - `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`.
-3. Open **Actions**, enable workflows if GitHub asks, then run **VOX Movies Monitor** once using **Run workflow**.
-4. The first successful run creates a baseline and does not send notifications for everything already listed. New items are reported on later runs.
+2. In **Settings → Actions → General → Workflow permissions**, enable read and write access to repository contents.
+3. Open **Actions → VOX Movies Monitor → Run workflow** to test it.
+4. The first complete successful scan creates a baseline. Existing showtimes will not trigger alerts; only later additions will.
 
-## Notes
+## Troubleshooting
 
-- GitHub Actions scheduled runs are not guaranteed to start at the exact minute; GitHub may delay scheduled workflows.
-- The workflow commits `seen.json` back to the repository. Keep the repository's Actions permission to write contents enabled.
-- If VOX changes its website markup or blocks requests, open the latest workflow run and inspect its logs.
-- The Coming Soon page parser is defensive but depends on VOX's live page structure. A zero-result extraction fails safely rather than clearing the saved state.
+If a VOX page does not load or its showtime cards are not found, the workflow uploads debug snapshots under **Artifacts → vox-debug-snapshots**. These files help identify whether Chrome received a block page, a timeout, or changed page markup.
+
+## Important
+
+GitHub Actions schedules are not guaranteed to start at the exact minute. VOX may also change its website or restrict automated traffic. The bot only observes availability and sends alerts; it does not reserve seats or purchase tickets.
