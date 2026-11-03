@@ -1,268 +1,350 @@
+import html
 import json
 import os
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
 from datetime import datetime
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
 
 import requests
-from bs4 import BeautifulSoup
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from selenium import webdriver
+from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
 
 BASE_URL = "https://egy.voxcinemas.com"
-SHOWTIMES_URL = f"{BASE_URL}/showtimes"
-CINEMA = "city-centre-almaza"
-BRANCH_SHOWTIMES_URL = f"{BASE_URL}/showtimes/{CINEMA}"
+VOX_BASE_URL = f"{BASE_URL}/showtimes?c=city-centre-almaza"
 BRANCH = "City Centre Almaza"
 STATE_FILE = "seen.json"
+EGYPT_TZ = ZoneInfo("Africa/Cairo")
 
-# Only alert for these three movie versions.
-TARGET_MOVIES = {
-    "dune part three",
-    "avengers doomsday",
-    "avengers doomsday infinity vision",
-}
-
-TOKEN = os.getenv("TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID")
-if not TOKEN or not CHAT_ID:
-    raise RuntimeError(
-        "Missing Telegram secrets. Add TOKEN and CHAT_ID "
-        "(or TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)."
-    )
-
-session = requests.Session()
-# Fail quickly. The workflow runs every five minutes, so the next run can retry.
-retry_policy = Retry(
-    total=0,
-    connect=0,
-    read=0,
-    status=0,
-    allowed_methods=frozenset(["GET"]),
+TOKEN = (
+    os.getenv("TOKEN")
+    or os.getenv("TELEGRAM_BOT_TOKEN")
+    or os.getenv("TELEGRAM_TOKEN")
 )
-adapter = HTTPAdapter(max_retries=retry_policy)
-session.mount("https://", adapter)
-session.mount("http://", adapter)
-session.headers.update({
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 Chrome/126.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-    "Cache-Control": "no-cache",
-})
+CHAT_ID = (
+    os.getenv("CHAT_ID")
+    or os.getenv("TELEGRAM_CHAT_ID")
+)
+if not TOKEN or not CHAT_ID:
+    raise RuntimeError("Missing Telegram secrets: TOKEN/CHAT_ID or TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID.")
+
+TARGET_DUNE = "dune part three"
+TARGET_AVENGERS = "avengers doomsday"
 
 
-def normalize_title(value):
-    value = value.lower().replace("&", " and ")
+def normalize(value):
+    value = (value or "").lower().replace("&", " and ")
     return re.sub(r"[^a-z0-9]+", " ", value).strip()
 
 
-def get_soup(url, params=None):
-    print(
-        f"Requesting: {url}" + (f" | params={params}" if params else ""),
-        flush=True,
+def now_egypt():
+    return datetime.now(EGYPT_TZ)
+
+
+def today_egypt():
+    return now_egypt().date()
+
+
+def date_label(target_date):
+    difference = (target_date - today_egypt()).days
+    if difference == 0:
+        return "Today"
+    if difference == 1:
+        return "Tomorrow"
+    return target_date.strftime("%a %d %b")
+
+
+def url_for_date(target_date):
+    if target_date == today_egypt():
+        return VOX_BASE_URL
+    return f"{VOX_BASE_URL}&d={target_date.strftime('%Y%m%d')}"
+
+
+def new_browser():
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
     )
-    response = session.get(url, params=params, timeout=(6, 18))
-    response.raise_for_status()
-    print(f"Received {len(response.content)} bytes from VOX.", flush=True)
-    return BeautifulSoup(response.text, "html.parser")
+    driver = webdriver.Chrome(options=options)
+    driver.set_page_load_timeout(35)
+    return driver
 
 
-def send_telegram(message):
-    if len(message) > 4000:
-        message = message[:3950] + "\n…"
-    response = session.post(
-        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-        data={
-            "chat_id": CHAT_ID,
-            "text": message,
-            "disable_web_page_preview": True,
-        },
-        timeout=(6, 15),
-    )
-    response.raise_for_status()
-    payload = response.json()
-    if not payload.get("ok"):
-        raise RuntimeError(f"Telegram API error: {payload}")
+def save_debug_snapshot(driver, label):
+    try:
+        driver.save_screenshot(f"debug_vox_{label}.png")
+        with open(f"debug_vox_{label}.html", "w", encoding="utf-8") as file:
+            file.write(driver.page_source)
+        print(f"Saved debug snapshot: debug_vox_{label}.html/png", flush=True)
+    except Exception as error:
+        print(f"Could not save debug snapshot: {error}", flush=True)
 
 
-def get_available_dates(soup, today):
-    dates = {today}
-    for link in soup.select("a[href]"):
-        query = parse_qs(urlparse(link.get("href", "")).query)
-        for value in query.get("d", []):
-            if re.fullmatch(r"\d{8}", value):
-                dates.add(value)
+def load_vox_page(driver, url, attempts=2):
+    for attempt in range(1, attempts + 1):
+        try:
+            print(f"Opening VOX page (attempt {attempt}/{attempts}): {url}", flush=True)
+            driver.get(url)
+            WebDriverWait(driver, 25).until(
+                EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, "article.movie-compare")
+                )
+            )
+            print("VOX showtime cards loaded in Chrome.", flush=True)
+            return True
+        except (TimeoutException, WebDriverException) as error:
+            print(f"VOX page attempt {attempt} failed: {type(error).__name__}: {error}", flush=True)
+            if attempt < attempts:
+                time.sleep(3)
+    return False
+
+
+def discover_open_dates(driver):
+    dates = {today_egypt()}
+    links = driver.find_elements(By.CSS_SELECTOR, "nav.date-filter li a[href]")
+    for link in links:
+        href = link.get_attribute("href") or ""
+        match = re.search(r"[?&]d=(\d{8})", href)
+        if match:
+            try:
+                dates.add(datetime.strptime(match.group(1), "%Y%m%d").date())
+            except ValueError:
+                pass
     return sorted(dates)
 
 
-def extract_target_showtimes(soup, date):
-    found = {}
+def target_kind(title, hall_name):
+    normalized_title = normalize(title)
+    normalized_hall = normalize(hall_name)
 
-    for article in soup.select("article.movie-compare"):
-        heading = article.select_one("h2")
-        if not heading:
+    if TARGET_DUNE in normalized_title or "dune part 3" in normalized_title:
+        return "Dune: Part Three"
+
+    if TARGET_AVENGERS in normalized_title:
+        if "infinity vision" in normalized_hall:
+            return "Avengers: Doomsday (Infinity Vision)"
+        return "Avengers: Doomsday"
+
+    return None
+
+
+def extract_target_slots(driver, target_date):
+    slots = {}
+    articles = driver.find_elements(By.CSS_SELECTOR, "article.movie-compare")
+
+    for article in articles:
+        title_elements = article.find_elements(By.TAG_NAME, "h2")
+        if not title_elements:
+            continue
+        title = title_elements[0].text.strip()
+        if TARGET_DUNE not in normalize(title) and "dune part 3" not in normalize(title) and TARGET_AVENGERS not in normalize(title):
             continue
 
-        name = heading.get_text(" ", strip=True)
-        normalized = normalize_title(name)
-        if normalized not in TARGET_MOVIES:
-            continue
+        info_elements = article.find_elements(By.CSS_SELECTOR, "a.read-more")
+        info_url = info_elements[0].get_attribute("href") if info_elements else ""
 
-        slug = article.get("data-slug") or normalized.replace(" ", "-")
-        details = article.select_one("a.read-more[href]")
-        movie_url = urljoin(BASE_URL, details["href"]) if details else SHOWTIMES_URL
-        movie = found.setdefault(
-            slug, {"name": name, "link": movie_url, "slots": {}}
+        hall_groups = article.find_elements(
+            By.CSS_SELECTOR, "div.dates ol.showtimes > li"
         )
+        for hall in hall_groups:
+            strong_elements = hall.find_elements(By.TAG_NAME, "strong")
+            hall_name = strong_elements[0].text.strip() if strong_elements else "Standard"
 
-        for group in article.select("ol.showtimes > li"):
-            format_tag = group.find("strong")
-            cinema_format = (
-                format_tag.get_text(" ", strip=True) if format_tag else "Standard"
-            )
+            kind = target_kind(title, hall_name)
+            if not kind:
+                continue
 
-            for link in group.select("a.showtime[href]"):
-                slot_id = link.get("data-id")
-                if not slot_id:
+            time_items = hall.find_elements(By.CSS_SELECTOR, "ol > li")
+            for item in time_items:
+                booking_id = item.get_attribute("data-id") or ""
+                link_elements = item.find_elements(By.CSS_SELECTOR, "a.showtime")
+                if not booking_id or not link_elements:
                     continue
 
-                key = f"{date}_{slot_id}"
-                movie["slots"][key] = {
-                    "date": date,
-                    "time": link.get_text(" ", strip=True),
-                    "format": cinema_format,
-                    "booking": urljoin(BASE_URL, link["href"]),
+                time_text = link_elements[0].text.strip()
+                booking_url = link_elements[0].get_attribute("href") or ""
+                if not time_text or not booking_url:
+                    continue
+
+                key = f"{target_date.isoformat()}:{booking_id}"
+                slots[key] = {
+                    "key": key,
+                    "movie": kind,
+                    "listed_title": title,
+                    "hall": hall_name,
+                    "date": target_date.isoformat(),
+                    "day": date_label(target_date),
+                    "time": time_text,
+                    "booking": urljoin(BASE_URL, booking_url),
+                    "movie_info": urljoin(BASE_URL, info_url) if info_url else "",
                 }
 
-    return found
+    return slots
 
 
 def load_state():
     if not os.path.exists(STATE_FILE):
-        return {"initialized": False, "movies": {}}
+        return {"initialized": False, "slots": {}}
 
     with open(STATE_FILE, "r", encoding="utf-8") as file:
         data = json.load(file)
 
+    # Convert the earlier nested seen.json format, if one exists.
+    slots = data.get("slots", {})
+    if not slots and isinstance(data.get("movies"), dict):
+        for movie in data["movies"].values():
+            for key, old_slot in movie.get("slots", {}).items():
+                slots[key] = old_slot
+
     return {
         "initialized": bool(data.get("initialized", False)),
-        "movies": data.get("movies", {}),
+        "slots": slots,
     }
 
 
+def send_telegram(message, booking_url):
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": message,
+        "disable_web_page_preview": True,
+        "reply_markup": {
+            "inline_keyboard": [[
+                {"text": "🎟️ احجز الآن", "url": booking_url}
+            ]]
+        },
+    }
+    response = requests.post(
+        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+        json=payload,
+        timeout=(8, 20),
+    )
+    response.raise_for_status()
+    result = response.json()
+    if not result.get("ok"):
+        raise RuntimeError(f"Telegram API returned an error: {result}")
+
+
+def alert_message(slot):
+    return (
+        "🚨 NEW VOX BOOKING AVAILABLE!\n\n"
+        f"🎬 {slot['movie']}\n"
+        f"📍 {BRANCH}\n"
+        f"📅 {slot['day']} ({slot['date']})\n"
+        f"🕒 {slot['time']}\n"
+        f"🎥 {slot['hall']}\n\n"
+        "🎟️ Booking link is attached below."
+    )
+
+
 def main():
-    today = datetime.now(ZoneInfo("Africa/Cairo")).strftime("%Y%m%d")
+    today = today_egypt()
     print(
-        f"VOX booking monitor started — {BRANCH} — {today}",
+        f"VOX booking monitor started — {BRANCH} — {today.strftime('%Y%m%d')}",
         flush=True,
     )
-    print("Targets: Dune: Part Three; Avengers: Doomsday; Avengers: Doomsday (Infinity Vision)", flush=True)
+    print(
+        "Targets: Dune: Part Three; Avengers: Doomsday; "
+        "Avengers: Doomsday (Infinity Vision)",
+        flush=True,
+    )
 
     old = load_state()
-    old_movies = old["movies"]
-
-    # The current date page also provides links to the upcoming showtime dates.
-    # Start with VOX's dedicated branch page instead of the filtered query URL.
-    # Date links on this page are used for the remaining days.
-    first_page = get_soup(BRANCH_SHOWTIMES_URL)
-
-    page_text = first_page.get_text(" ", strip=True).lower()
-    if "view times and book" not in page_text or "city centre almaza" not in page_text:
-        raise RuntimeError(
-            "VOX page did not contain the expected cinema/showtimes content; "
-            "saved state was not changed."
-        )
-
-    dates = get_available_dates(first_page, today)
-    print(f"Dates discovered: {', '.join(dates)}", flush=True)
-
-    scraped_movies = {}
+    driver = new_browser()
+    scraped_slots = {}
     failed_dates = []
 
-    def fetch_date(date):
-        page = first_page if date == today else get_soup(
-            SHOWTIMES_URL, {"c": CINEMA, "d": date}
+    try:
+        if not load_vox_page(driver, url_for_date(today)):
+            save_debug_snapshot(driver, "today")
+            raise RuntimeError(
+                "VOX did not render showtime cards in headless Chrome. "
+                "Debug snapshots were saved; state was not changed."
+            )
+
+        dates = discover_open_dates(driver)
+        print(
+            "Dates currently open for booking: "
+            + ", ".join(date.isoformat() for date in dates),
+            flush=True,
         )
-        return date, extract_target_showtimes(page, date)
 
-    # Check dates concurrently so a long list of future dates does not delay alerts.
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = {executor.submit(fetch_date, date): date for date in dates}
-        for future in as_completed(futures):
-            date = futures[future]
-            try:
-                _, day_movies = future.result()
-                for slug, movie in day_movies.items():
-                    item = scraped_movies.setdefault(
-                        slug,
-                        {"name": movie["name"], "link": movie["link"], "slots": {}},
-                    )
-                    item["slots"].update(movie["slots"])
-            except requests.exceptions.RequestException as error:
-                failed_dates.append(date)
-                print(f"WARNING: Could not check {date}: {error}", flush=True)
+        for target_date in dates:
+            if target_date != today:
+                url = url_for_date(target_date)
+                if not load_vox_page(driver, url):
+                    failed_dates.append(target_date.isoformat())
+                    save_debug_snapshot(driver, target_date.isoformat())
+                    continue
 
-    print(
-        f"Target movies found: {len(scraped_movies)}; "
-        f"slots found: {sum(len(m['slots']) for m in scraped_movies.values())}",
-        flush=True,
-    )
+            day_slots = extract_target_slots(driver, target_date)
+            scraped_slots.update(day_slots)
+            print(
+                f"{target_date}: found {len(day_slots)} target booking slot(s).",
+                flush=True,
+            )
+            time.sleep(1)
+
+    finally:
+        driver.quit()
+
+    print(f"Total target slots found: {len(scraped_slots)}", flush=True)
     if failed_dates:
         print(
-            "WARNING: Some dates could not be checked: " + ", ".join(sorted(failed_dates)),
+            "Some dates could not be checked and will be retried next run: "
+            + ", ".join(failed_dates),
             flush=True,
         )
 
-    # An empty result is valid: it means these films do not have bookable slots yet.
     if not old["initialized"]:
-        print(
-            "Creating first baseline. Any slots already visible now will not trigger alerts.",
-            flush=True,
-        )
+        if failed_dates:
+            print(
+                "Baseline not finalized because some dates failed. "
+                "A complete scan is required before alerts are enabled.",
+                flush=True,
+            )
+        else:
+            print(
+                "Creating initial baseline. Existing slots will not trigger alerts.",
+                flush=True,
+            )
     else:
-        for slug, movie in scraped_movies.items():
-            previous = old_movies.get(slug, {})
-            old_slots = set(previous.get("slots", {}))
-            new_slots = set(movie["slots"]) - old_slots
+        for key, slot in sorted(scraped_slots.items()):
+            if key in old["slots"]:
+                continue
+            send_telegram(alert_message(slot), slot["booking"])
+            print(
+                f"Telegram alert sent: {slot['movie']} | {slot['date']} | "
+                f"{slot['time']} | {slot['hall']}",
+                flush=True,
+            )
 
-            for key in sorted(new_slots):
-                slot = movie["slots"][key]
-                send_telegram(
-                    "🚨 NEW VOX BOOKING AVAILABLE!\n\n"
-                    f"🎬 {movie['name']}\n"
-                    f"📍 {BRANCH}\n"
-                    f"📅 {slot['date']}\n"
-                    f"🕒 {slot['time']}\n"
-                    f"🎥 {slot['format']}\n\n"
-                    f"🎟️ BOOK NOW:\n{slot['booking']}"
-                )
-                print(f"Telegram alert sent: {movie['name']} — {slot['date']} {slot['time']}", flush=True)
+    # Preserve previously known slots if a date could not be checked.
+    merged_slots = dict(old["slots"])
+    merged_slots.update(scraped_slots)
 
-    # Keep old slots too, so a slot disappearing and later reappearing is not
-    # mistaken for a brand-new booking.
-    merged_movies = dict(old_movies)
-    for slug, movie in scraped_movies.items():
-        previous_slots = old_movies.get(slug, {}).get("slots", {})
-        merged_movies[slug] = {
-            "name": movie["name"],
-            "link": movie["link"],
-            "slots": {**previous_slots, **movie["slots"]},
-        }
-
+    initialized = old["initialized"] or not failed_dates
     state = {
-        "initialized": True,
-        "movies": merged_movies,
-        "updated_at": datetime.now(ZoneInfo("Africa/Cairo")).isoformat(),
+        "initialized": initialized,
+        "slots": merged_slots,
+        "updated_at": now_egypt().isoformat(),
     }
     with open(STATE_FILE, "w", encoding="utf-8") as file:
         json.dump(state, file, ensure_ascii=False, indent=2)
 
     if failed_dates:
-        print("Monitoring completed with warnings; failed dates will be retried next run.", flush=True)
+        print("Monitoring completed with warnings.", flush=True)
     else:
         print("Monitoring completed successfully.", flush=True)
 
