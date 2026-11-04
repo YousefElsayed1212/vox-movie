@@ -1,0 +1,45 @@
+name: VOX HTML Request Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-html:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Test VOX showtimes HTML with requests
+        run: |
+          python - <<'PY'
+          import requests
+          import re
+
+          url = "https://egy.voxcinemas.com/showtimes?c=city-centre-almaza"
+          headers = {
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+              "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+              "Accept-Language": "en-US,en;q=0.9",
+              "Cache-Control": "no-cache",
+              "Pragma": "no-cache",
+              "Referer": "https://egy.voxcinemas.com/",
+          }
+
+          try:
+              response = requests.get(url, headers=headers, timeout=(15, 30))
+              body = response.text
+              print("HTTP_STATUS:", response.status_code)
+              print("FINAL_URL:", response.url)
+              print("CONTENT_TYPE:", response.headers.get("content-type", ""))
+              print("BODY_LENGTH:", len(response.content))
+              print("HAS_MOVIE_COMPARE:", "movie-compare" in body)
+              print("HAS_DATE_FILTER:", "date-filter" in body)
+              print("HAS_ACCESS_DENIED:", bool(re.search(r"access denied|error code: 520|captcha|request blocked", body, re.I)))
+              print("BODY_PREVIEW:", re.sub(r"\\s+", " ", body[:1000]))
+              response.raise_for_status()
+              if "movie-compare" not in body:
+                  raise SystemExit("Request succeeded, but expected showtime HTML was not found.")
+              print("RESULT: HTML showtime markup detected.")
+          except requests.RequestException as exc:
+              print("REQUEST_ERROR:", repr(exc))
+              raise
+          PY
