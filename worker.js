@@ -163,6 +163,7 @@ function discoverDates(html) {
 
 function extractSlots(html, date) {
   const slots = [];
+  const dateKey = date ? date.replace(/^(\d{4})(\d{2})(\d{2})$/, "$1-$2-$3") : new Intl.DateTimeFormat("en-CA", { timeZone: "Africa/Cairo" }).format(new Date());
   const articles = html.match(/<article\b[^>]*class=["'][^"']*\bmovie-compare\b[^"']*["'][^>]*>[\s\S]*?<\/article>/gi) || [];
 
   for (const article of articles) {
