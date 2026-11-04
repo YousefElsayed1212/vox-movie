@@ -219,7 +219,9 @@ async function fetchShowtimes(date) {
     headers: {
       "Accept": "text/html,application/xhtml+xml",
       "Accept-Language": "en-US,en;q=0.9",
-      "User-Agent": "Mozilla/5.0 (compatible; VOXBookingMonitor/1.0)"
+      "Cache-Control": "no-cache",
+      "Referer": "https://egy.voxcinemas.com/",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
     },
     redirect: "follow"
   });
@@ -267,12 +269,15 @@ async function monitor(env) {
     headers: {
       "Accept": "text/html,application/xhtml+xml",
       "Accept-Language": "en-US,en;q=0.9",
-      "User-Agent": "Mozilla/5.0 (compatible; VOXBookingMonitor/1.0)"
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
     },
     redirect: "follow"
   });
 
-  if (!firstUrl.ok) throw new Error(`VOX returned HTTP ${firstUrl.status} on the date index`);
+  if (!firstUrl.ok) {
+    const diagnostic = (await firstUrl.text()).slice(0, 500).replace(/\\s+/g, " ");
+    throw new Error(`VOX returned HTTP ${firstUrl.status} on the date index. Response: ${diagnostic}`);
+  }
   const indexHtml = await firstUrl.text();
   if (!indexHtml.includes("movie-compare")) {
     throw new Error("VOX date index did not contain showtime cards (possible 403 or markup change).");
