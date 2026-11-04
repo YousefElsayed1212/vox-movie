@@ -1144,7 +1144,18 @@
       "time": "3:30pm",
       "booking": "https://egy.voxcinemas.com/booking/0047-276894",
       "movie_info": "https://egy.voxcinemas.com/movies/avengers-doomsday"
+    },
+    "2026-12-17:0047-276890": {
+      "key": "2026-12-17:0047-276890",
+      "movie": "Avengers: Doomsday",
+      "listed_title": "Avengers: Doomsday",
+      "hall": "GOLD",
+      "date": "2026-12-17",
+      "day": "Thu 17 Dec",
+      "time": "11:15am",
+      "booking": "https://egy.voxcinemas.com/booking/0047-276890",
+      "movie_info": "https://egy.voxcinemas.com/movies/avengers-doomsday"
     }
   },
-  "updated_at": "2026-11-04T18:17:02.594652+02:00"
+  "updated_at": "2026-11-05T00:00:23.437792+02:00"
 }
