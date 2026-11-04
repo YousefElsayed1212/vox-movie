@@ -199,7 +199,7 @@ function extractSlots(html, date) {
       if (!bookingUrl.startsWith(BASE_URL + "/booking/")) continue;
 
       slots.push({
-        key: `${date}:${bookingId}`,
+        key: `${dateKey}:${bookingId}`,
         booking: bookingUrl,
         movie
       });
